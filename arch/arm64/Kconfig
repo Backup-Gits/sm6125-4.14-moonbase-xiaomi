@@ -260,12 +260,6 @@ config GENERIC_HWEIGHT
 config GENERIC_CSUM
         def_bool y
 
-config THERMAL_SWITCH
-    default n
-        bool "Support themral config switch"
-	    help
-	        Support themral config switch.
-
 config GENERIC_CALIBRATE_DELAY
 	def_bool y
 
@@ -889,9 +883,23 @@ config ARCH_HAS_CACHE_LINE_SIZE
 
 source "mm/Kconfig"
 
+
 # Supported by clang >= 7.0
 config CC_HAVE_SHADOW_CALL_STACK
 	def_bool y if CLANG_VERSION >= 70000
+
+config THERMAL_SWITCH
+	default n
+	bool "Support thermal config switch"
+	help
+	  Support thermal config switch.
+
+config DISABLE_DOWNLOAD
+	default n
+	bool "Disable download mode"
+	help
+	  Disable download mode.
+>>>>>>> fa729a17e909 (power: Import ginkgo changes)
 
 config ARM64_DMA_USE_IOMMU
 	bool "ARM64 DMA iommu integration"
