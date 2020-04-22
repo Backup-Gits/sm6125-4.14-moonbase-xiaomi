@@ -478,7 +478,7 @@ static inline void sde_rsc_debug_dump(u32 mux_sel)
 {
 }
 
-static inline void dsi_ctrl_debug_dump(u32 entries, u32 size)
+static inline void dsi_ctrl_debug_dump(u32 *entries, u32 size)
 {
 }
 
