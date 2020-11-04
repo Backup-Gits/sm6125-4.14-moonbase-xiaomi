@@ -901,7 +901,6 @@ config DISABLE_DOWNLOAD
 	bool "Disable download mode"
 	help
 	  Disable download mode.
->>>>>>> fa729a17e909 (power: Import ginkgo changes)
 
 config ARM64_DMA_USE_IOMMU
 	bool "ARM64 DMA iommu integration"
