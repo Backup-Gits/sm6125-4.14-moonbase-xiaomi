@@ -5015,6 +5015,12 @@ int kgsl_device_platform_probe(struct kgsl_device *device)
 	if (status)
 		goto error_close_mmu;
 
+        /* Allocate memory for dma_parms and set the max_seg_size */
+	device->dev->dma_parms =
+		kzalloc(sizeof(*device->dev->dma_parms), GFP_KERNEL);
+
+	dma_set_max_seg_size(device->dev, KGSL_DMA_BIT_MASK);
+
 	/* Initialize the memory pools */
 	kgsl_init_page_pools(device->pdev);
 
@@ -5083,6 +5089,9 @@ void kgsl_device_platform_remove(struct kgsl_device *device)
 {
 	destroy_workqueue(device->events_wq);
 
+        kfree(device->dev->dma_parms);
+	device->dev->dma_parms = NULL;
+
 	kgsl_device_snapshot_close(device);
 
 	kgsl_exit_page_pools();
@@ -5143,8 +5152,6 @@ static int __init kgsl_core_init(void)
 	int result = 0;
 
 	struct sched_param param = { .sched_priority = 6 };
-
-	place_marker("M - DRIVER KGSL Init");
 
 	/* alloc major and minor device numbers */
 	result = alloc_chrdev_region(&kgsl_driver.major, 0, KGSL_DEVICE_MAX,
