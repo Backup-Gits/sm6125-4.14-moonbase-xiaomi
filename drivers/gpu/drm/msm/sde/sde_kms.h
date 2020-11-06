@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015-2019, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2015-2020, The Linux Foundation. All rights reserved.
  * Copyright (C) 2013 Red Hat
  * Author: Rob Clark <robdclark@gmail.com>
  *
@@ -48,7 +48,10 @@
  */
 #define SDE_DEBUG(fmt, ...)                                                \
 	do {                                                               \
-		no_printk(fmt, ##__VA_ARGS__);                             \
+		if (unlikely(drm_debug & DRM_UT_KMS))                      \
+			DRM_DEBUG(fmt, ##__VA_ARGS__); \
+		else                                                       \
+			pr_debug(fmt, ##__VA_ARGS__);                      \
 	} while (0)
 
 /**
@@ -69,7 +72,10 @@
  */
 #define SDE_DEBUG_DRIVER(fmt, ...)                                         \
 	do {                                                               \
-		no_printk(fmt, ##__VA_ARGS__);                             \
+		if (unlikely(drm_debug & DRM_UT_DRIVER))                   \
+			DRM_ERROR(fmt, ##__VA_ARGS__); \
+		else                                                       \
+			pr_debug(fmt, ##__VA_ARGS__);                      \
 	} while (0)
 
 #define SDE_ERROR(fmt, ...) pr_err("[sde error]" fmt, ##__VA_ARGS__)
@@ -268,6 +274,8 @@ struct sde_kms {
 
 	bool first_kickoff;
 	bool qdss_enabled;
+
+	struct pm_qos_request pm_qos_irq_req;
 };
 
 struct vsync_info {

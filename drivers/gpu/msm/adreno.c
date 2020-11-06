@@ -18,6 +18,7 @@
 #include <linux/delay.h>
 #include <linux/io.h>
 #include <soc/qcom/scm.h>
+#include <soc/qcom/boot_stats.h>
 
 #include <linux/msm-bus-board.h>
 #include <linux/msm-bus.h>
@@ -66,7 +67,7 @@ static unsigned int counter_delta(struct kgsl_device *device,
 
 static struct devfreq_msm_adreno_tz_data adreno_tz_data = {
 	.bus = {
-		.max = 1200,
+		.max = 350,
 	},
 	.device_id = KGSL_DEVICE_3D0,
 };
@@ -557,6 +558,8 @@ static irqreturn_t adreno_irq_handler(struct kgsl_device *device)
 		tmp &= ~BIT(i);
 	}
 
+	gpudev->irq_trace(adreno_dev, status);
+
 	/*
 	 * Clear ADRENO_INT_RBBM_AHB_ERROR bit after this interrupt has been
 	 * cleared in its respective handler
@@ -1004,17 +1007,17 @@ static int adreno_of_get_power(struct adreno_device *adreno_dev,
 	/* get pm-qos-active-latency, set it to default if not found */
 	if (of_property_read_u32(node, "qcom,pm-qos-active-latency",
 		&device->pwrctrl.pm_qos_active_latency))
-		device->pwrctrl.pm_qos_active_latency = 1000;
+		device->pwrctrl.pm_qos_active_latency = 501;
 
 	/* get pm-qos-cpu-mask-latency, set it to default if not found */
 	if (of_property_read_u32(node, "qcom,l2pc-cpu-mask-latency",
 		&device->pwrctrl.pm_qos_cpu_mask_latency))
-		device->pwrctrl.pm_qos_cpu_mask_latency = 1000;
+		device->pwrctrl.pm_qos_cpu_mask_latency = 501;
 
 	/* get pm-qos-wakeup-latency, set it to default if not found */
 	if (of_property_read_u32(node, "qcom,pm-qos-wakeup-latency",
 		&device->pwrctrl.pm_qos_wakeup_latency))
-		device->pwrctrl.pm_qos_wakeup_latency = 100;
+		device->pwrctrl.pm_qos_wakeup_latency = 101;
 
 	if (of_property_read_u32(node, "qcom,idle-timeout", &timeout))
 		timeout = 64;
@@ -1194,6 +1197,8 @@ static int adreno_probe(struct platform_device *pdev)
 	struct adreno_device *adreno_dev;
 	int status;
 
+	place_marker("M - DRIVER GPU Init");
+
 	adreno_dev = adreno_get_dev(pdev);
 
 	if (adreno_dev == NULL) {
@@ -1305,6 +1310,9 @@ static int adreno_probe(struct platform_device *pdev)
 
 	kgsl_pwrscale_init(&pdev->dev, CONFIG_QCOM_ADRENO_DEFAULT_GOVERNOR);
 
+	/* Initialize coresight for the target */
+	adreno_coresight_init(adreno_dev);
+
 	/* Get the system cache slice descriptor for GPU */
 	adreno_dev->gpu_llc_slice = adreno_llc_getd(&pdev->dev, "gpu");
 	if (IS_ERR(adreno_dev->gpu_llc_slice) &&
@@ -1320,6 +1328,7 @@ static int adreno_probe(struct platform_device *pdev)
 		KGSL_DRV_WARN(device,
 			"Failed to get gpuhtw LLC slice descriptor %ld\n",
 			PTR_ERR(adreno_dev->gpuhtw_llc_slice));
+
 	place_marker("M - DRIVER GPU Ready");
 out:
 	if (status) {
@@ -1374,6 +1383,7 @@ static int adreno_remove(struct platform_device *pdev)
 
 	adreno_sysfs_close(adreno_dev);
 
+	adreno_coresight_remove(adreno_dev);
 	adreno_profile_close(adreno_dev);
 
 	/* Release the system cache slice descriptor */
@@ -1529,6 +1539,8 @@ static int adreno_init(struct kgsl_device *device)
 	if (test_bit(ADRENO_DEVICE_INITIALIZED, &adreno_dev->priv))
 		return 0;
 
+	place_marker("M - DRIVER ADRENO Init");
+
 	/*
 	 * Either the microcode read failed because the usermodehelper isn't
 	 * available or the microcode was corrupted. Fail the init and force
@@ -1602,6 +1614,8 @@ static int adreno_init(struct kgsl_device *device)
 
 	}
 
+	place_marker("M - DRIVER ADRENO Ready");
+
 	return 0;
 }
 
@@ -1642,10 +1656,10 @@ static void _set_secvid(struct kgsl_device *device)
 		adreno_writereg64(adreno_dev,
 			ADRENO_REG_RBBM_SECVID_TSB_TRUSTED_BASE,
 			ADRENO_REG_RBBM_SECVID_TSB_TRUSTED_BASE_HI,
-			KGSL_IOMMU_SECURE_BASE(&device->mmu));
+			device->mmu.secure_base);
 		adreno_writereg(adreno_dev,
 			ADRENO_REG_RBBM_SECVID_TSB_TRUSTED_SIZE,
-			KGSL_IOMMU_SECURE_SIZE);
+			device->mmu.secure_size);
 		if (ADRENO_QUIRK(adreno_dev, ADRENO_QUIRK_SECVID_SET_ONCE))
 			set = true;
 	}
@@ -1757,6 +1771,17 @@ static int _adreno_start(struct adreno_device *adreno_dev)
 
 	regulator_left_on = regulators_left_on(device);
 
+	/* Clear any GPU faults that might have been left over */
+	adreno_clear_gpu_fault(adreno_dev);
+
+	/*
+	 * Keep high bus vote to reduce AHB latency
+	 * during FW loading and wakeup.
+	 */
+	if (device->pwrctrl.ahbpath_pcl)
+		msm_bus_scale_client_update_request(device->pwrctrl.ahbpath_pcl,
+			KGSL_AHB_PATH_HIGH);
+
 	/* Put the GPU in a responsive state */
 	status = kgsl_pwrctrl_change_state(device, KGSL_STATE_AWARE);
 	if (status)
@@ -1783,14 +1808,6 @@ static int _adreno_start(struct adreno_device *adreno_dev)
 	 * halted GPU transactions.
 	 */
 	adreno_deassert_gbif_halt(adreno_dev);
-
-	/*
-	 * Observed race between timeout fault (long IB detection) and
-	 * MISC hang (hard fault). MISC hang can be set while in recovery from
-	 * timeout fault. If fault flag is set in start path CP init fails.
-	 * Clear gpu fault to avoid such race.
-	 */
-	adreno_clear_gpu_fault(adreno_dev);
 
 	if (adreno_is_a640v1(adreno_dev)) {
 		ret = adreno_program_smmu_aperture(device);
@@ -1984,6 +2001,9 @@ static int _adreno_start(struct adreno_device *adreno_dev)
 	 */
 	adreno_llc_setup(device);
 
+	/* Re-initialize the coresight registers if applicable */
+	adreno_coresight_start(adreno_dev);
+
 	adreno_irqctrl(adreno_dev, 1);
 
 	adreno_perfcounter_start(adreno_dev);
@@ -2124,6 +2144,9 @@ static int adreno_stop(struct kgsl_device *device)
 	adreno_llc_deactivate_slice(adreno_dev->gpu_llc_slice);
 	adreno_llc_deactivate_slice(adreno_dev->gpuhtw_llc_slice);
 
+	/* Save active coresight registers if applicable */
+	adreno_coresight_stop(adreno_dev);
+
 	/* Save physical performance counter values before GPU power down*/
 	adreno_perfcounter_save(adreno_dev);
 
@@ -2232,6 +2255,14 @@ int adreno_reset(struct kgsl_device *device, int fault)
 		}
 	}
 	if (ret) {
+		unsigned long flags = device->pwrctrl.ctrl_flags;
+
+		/*
+		 * Clear ctrl_flags to ensure clocks and regulators are
+		 * turned off
+		 */
+		device->pwrctrl.ctrl_flags = 0;
+
 		/* If soft reset failed/skipped, then pull the power */
 		kgsl_pwrctrl_change_state(device, KGSL_STATE_INIT);
 		/* since device is officially off now clear start bit */
@@ -2249,6 +2280,8 @@ int adreno_reset(struct kgsl_device *device, int fault)
 					break;
 			}
 		}
+
+		device->pwrctrl.ctrl_flags = flags;
 	}
 	if (ret)
 		return ret;
@@ -2628,6 +2661,32 @@ static int adreno_getproperty(struct kgsl_device *device,
 	}
 	break;
 
+	case KGSL_PROP_MACROTILING_CHANNELS:
+	{
+		unsigned int channel;
+
+		if (sizebytes < sizeof(unsigned int)) {
+			status = -EINVAL;
+			break;
+		}
+
+		if (of_property_read_u32(device->pdev->dev.of_node,
+			"qcom,macrotiling-channels", &channel)) {
+			/* return error when not set in device tree
+			 * and let user decide.
+			 */
+			status = -EINVAL;
+			break;
+		}
+
+		if (copy_to_user(value, &channel, sizeof(channel))) {
+			status = -EFAULT;
+			break;
+		}
+		status = 0;
+	}
+	break;
+
 	default:
 		status = -EINVAL;
 	}
@@ -2936,6 +2995,9 @@ int adreno_soft_reset(struct kgsl_device *device)
 
 	/* Reinitialize the GPU */
 	gpudev->start(adreno_dev);
+
+	/* Re-initialize the coresight registers if applicable */
+	adreno_coresight_start(adreno_dev);
 
 	/* Enable IRQ */
 	adreno_irqctrl(adreno_dev, 1);
@@ -4068,12 +4130,17 @@ static int __kgsl_3d_init(void *arg)
 
 static int __init kgsl_3d_init(void)
 {
+#ifdef CONFIG_PLATFORM_AUTO
 	struct task_struct *kgsl_3d_init_task =
 		kthread_run(__kgsl_3d_init, NULL, "kgsl_3d_init");
 	if (IS_ERR(kgsl_3d_init_task))
 		return PTR_ERR(kgsl_3d_init_task);
 	else
 		return 0;
+#else
+	__kgsl_3d_init(NULL);
+	return 0;
+#endif
 }
 
 static void __exit kgsl_3d_exit(void)

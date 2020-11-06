@@ -36,6 +36,7 @@ static void _update_wptr(struct adreno_device *adreno_dev, bool reset_timer)
 	struct adreno_ringbuffer *rb = adreno_dev->cur_rb;
 	unsigned long flags;
 	int ret = 0;
+	struct kgsl_device *device = KGSL_DEVICE(adreno_dev);
 
 	spin_lock_irqsave(&rb->preempt_lock, flags);
 
@@ -45,10 +46,29 @@ static void _update_wptr(struct adreno_device *adreno_dev, bool reset_timer)
 		 * dispatcher context. Do it now.
 		 */
 		if (rb->skip_inline_wptr) {
+			/*
+			 * There could be a situation where GPU comes out of
+			 * ifpc after a fenced write transaction but before
+			 * reading AHB_FENCE_STATUS from KMD, it goes back to
+			 * ifpc due to inactivity (kernel scheduler plays a
+			 * role here). Thus, the GPU could technically be
+			 * re-collapsed between subsequent register writes
+			 * leading to a prolonged preemption sequence. The
+			 * keepalive bit prevents any further power collapse
+			 * while it is set.
+			 */
+			if (gmu_core_isenabled(device))
+				gmu_core_regrmw(device, A6XX_GMU_AO_SPARE_CNTL,
+					0x0, 0x2);
 
 			ret = adreno_gmu_fenced_write(adreno_dev,
 				ADRENO_REG_CP_RB_WPTR, rb->wptr,
 				FENCE_STATUS_WRITEDROPPED0_MASK);
+
+			/* Clear the keep alive */
+			if (gmu_core_isenabled(device))
+				gmu_core_regrmw(device, A6XX_GMU_AO_SPARE_CNTL,
+					0x2, 0x0);
 
 			reset_timer = true;
 			rb->skip_inline_wptr = false;
@@ -403,7 +423,8 @@ err:
 	adreno_set_gpu_fault(adreno_dev, ADRENO_GMU_FAULT);
 	adreno_dispatcher_schedule(device);
 	/* Clear the keep alive */
-	gmu_core_regrmw(device, A6XX_GMU_AO_SPARE_CNTL, 0x2, 0x0);
+	if (gmu_core_gpmu_isenabled(device))
+		gmu_core_regrmw(device, A6XX_GMU_AO_SPARE_CNTL, 0x2, 0x0);
 }
 
 void a6xx_preemption_callback(struct adreno_device *adreno_dev, int bit)
@@ -613,7 +634,7 @@ void a6xx_preemption_start(struct adreno_device *adreno_dev)
 }
 
 static int a6xx_preemption_ringbuffer_init(struct adreno_device *adreno_dev,
-	struct adreno_ringbuffer *rb)
+	struct adreno_ringbuffer *rb, uint64_t counteraddr)
 {
 	struct kgsl_device *device = KGSL_DEVICE(adreno_dev);
 	int ret;
@@ -668,7 +689,7 @@ static int a6xx_preemption_ringbuffer_init(struct adreno_device *adreno_dev,
 	kgsl_sharedmem_writeq(device, &rb->preemption_desc,
 		PREEMPT_RECORD(rbase), rb->buffer_desc.gpuaddr);
 	kgsl_sharedmem_writeq(device, &rb->preemption_desc,
-		PREEMPT_RECORD(counter), 0);
+		PREEMPT_RECORD(counter), counteraddr);
 
 	return 0;
 }
@@ -711,6 +732,7 @@ static void _preemption_close(struct adreno_device *adreno_dev)
 	unsigned int i;
 
 	del_timer(&preempt->timer);
+	kgsl_free_global(device, &preempt->counters);
 	a6xx_preemption_iommu_close(adreno_dev);
 
 	FOR_EACH_RINGBUFFER(adreno_dev, rb, i) {
@@ -738,6 +760,7 @@ int a6xx_preemption_init(struct adreno_device *adreno_dev)
 	struct adreno_ringbuffer *rb;
 	int ret;
 	unsigned int i;
+	uint64_t addr;
 
 	/* We are dependent on IOMMU to make preemption go on the CP side */
 	if (kgsl_mmu_get_mmutype(device) != KGSL_MMU_TYPE_IOMMU)
@@ -748,11 +771,23 @@ int a6xx_preemption_init(struct adreno_device *adreno_dev)
 	setup_timer(&preempt->timer, _a6xx_preemption_timer,
 		(unsigned long) adreno_dev);
 
+	/* Allocate mem for storing preemption counters */
+	ret = kgsl_allocate_global(device, &preempt->counters,
+		adreno_dev->num_ringbuffers *
+		A6XX_CP_CTXRECORD_PREEMPTION_COUNTER_SIZE, 0, 0,
+		"preemption_counters");
+	if (ret)
+		goto err;
+
+	addr = preempt->counters.gpuaddr;
+
 	/* Allocate mem for storing preemption switch record */
 	FOR_EACH_RINGBUFFER(adreno_dev, rb, i) {
-		ret = a6xx_preemption_ringbuffer_init(adreno_dev, rb);
+		ret = a6xx_preemption_ringbuffer_init(adreno_dev, rb, addr);
 		if (ret)
 			goto err;
+
+		addr += A6XX_CP_CTXRECORD_PREEMPTION_COUNTER_SIZE;
 	}
 
 	ret = a6xx_preemption_iommu_init(adreno_dev);
@@ -775,7 +810,7 @@ void a6xx_preemption_context_destroy(struct kgsl_context *context)
 	gpumem_free_entry(context->user_ctxt_record);
 
 	/* Put the extra ref from gpumem_alloc_entry() */
-	kgsl_mem_entry_put_deferred(context->user_ctxt_record);
+	kgsl_mem_entry_put(context->user_ctxt_record);
 }
 
 int a6xx_preemption_context_init(struct kgsl_context *context)

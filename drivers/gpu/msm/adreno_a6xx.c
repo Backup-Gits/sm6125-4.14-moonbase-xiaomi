@@ -1,4 +1,4 @@
-/* Copyright (c)2017-2019, The Linux Foundation. All rights reserved.
+/* Copyright (c)2017-2020, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -503,6 +503,8 @@ static void a6xx_pwrup_reglist_init(struct adreno_device *adreno_dev)
 
 static void a6xx_init(struct adreno_device *adreno_dev)
 {
+	a6xx_crashdump_init(adreno_dev);
+
 	/*
 	 * If the GMU is not enabled, rewrite the offset for the always on
 	 * counters to point to the CP always on instead of GMU always on
@@ -782,7 +784,7 @@ static void a6xx_start(struct adreno_device *adreno_dev)
 {
 	struct kgsl_device *device = KGSL_DEVICE(adreno_dev);
 	struct gmu_dev_ops *gmu_dev_ops = GMU_DEVICE_OPS(device);
-	unsigned int bit, mal, mode, glbl_inv;
+	unsigned int bit, mal, mode, glbl_inv, channel;
 	unsigned int amsbc = 0;
 	static bool patch_reglist;
 
@@ -883,6 +885,10 @@ static void a6xx_start(struct adreno_device *adreno_dev)
 		"qcom,ubwc-mode", &mode))
 		mode = 0;
 
+	if (of_property_read_u32(device->pdev->dev.of_node,
+		"qcom,macrotiling-channels", &channel))
+		channel = 0; /* unknown and keep reset value */
+
 	switch (mode) {
 	case KGSL_UBWC_1_0:
 		mode = 1;
@@ -897,6 +903,9 @@ static void a6xx_start(struct adreno_device *adreno_dev)
 	default:
 		break;
 	}
+
+	if (channel == 8)
+		kgsl_regwrite(device, A6XX_RBBM_NC_MODE_CNTL, 1);
 
 	if (bit >= 13 && bit <= 16)
 		bit = (bit - 13) & 0x03;
@@ -1417,10 +1426,8 @@ static int a6xx_soft_reset(struct adreno_device *adreno_dev)
 	 * For the soft reset case with GMU enabled this part is done
 	 * by the GMU firmware
 	 */
-	if (gmu_core_gpmu_isenabled(device) &&
-		!test_bit(ADRENO_DEVICE_HARD_RESET, &adreno_dev->priv))
+	if (gmu_core_gpmu_isenabled(device))
 		return 0;
-
 
 	adreno_writereg(adreno_dev, ADRENO_REG_RBBM_SW_RESET_CMD, 1);
 	/*
@@ -1506,37 +1513,37 @@ static int a6xx_reset(struct kgsl_device *device, int fault)
 	struct adreno_device *adreno_dev = ADRENO_DEVICE(device);
 	int ret = -EINVAL;
 	int i = 0;
+	unsigned long flags = device->pwrctrl.ctrl_flags;
 
 	/* Use the regular reset sequence for No GMU */
 	if (!gmu_core_gpmu_isenabled(device))
 		return adreno_reset(device, fault);
 
+	/* Clear ctrl_flags to ensure clocks and regulators are turned off */
+	device->pwrctrl.ctrl_flags = 0;
+
 	/* Transition from ACTIVE to RESET state */
 	kgsl_pwrctrl_change_state(device, KGSL_STATE_RESET);
 
-	if (ret) {
-		/* If soft reset failed/skipped, then pull the power */
-		set_bit(ADRENO_DEVICE_HARD_RESET, &adreno_dev->priv);
-		/* since device is officially off now clear start bit */
-		clear_bit(ADRENO_DEVICE_STARTED, &adreno_dev->priv);
+	/* since device is officially off now clear start bit */
+	clear_bit(ADRENO_DEVICE_STARTED, &adreno_dev->priv);
 
-		/* Keep trying to start the device until it works */
-		for (i = 0; i < NUM_TIMES_RESET_RETRY; i++) {
-			ret = adreno_start(device, 0);
-			if (!ret)
-				break;
+	/* Keep trying to start the device until it works */
+	for (i = 0; i < NUM_TIMES_RESET_RETRY; i++) {
+		ret = adreno_start(device, 0);
+		if (!ret)
+			break;
 
-			msleep(20);
-		}
+		msleep(20);
 	}
-
-	clear_bit(ADRENO_DEVICE_HARD_RESET, &adreno_dev->priv);
 
 	if (ret)
 		return ret;
 
 	if (i != 0)
 		KGSL_DRV_WARN(device, "Device hard reset tried %d tries\n", i);
+
+	device->pwrctrl.ctrl_flags = flags;
 
 	/*
 	 * If active_cnt is non-zero then the system was active before
@@ -1761,6 +1768,29 @@ static void a6xx_cp_callback(struct adreno_device *adreno_dev, int bit)
 	adreno_dispatcher_schedule(device);
 }
 
+/*
+ * a6xx_gpc_err_int_callback() - Isr for GPC error interrupts
+ * @adreno_dev: Pointer to device
+ * @bit: Interrupt bit
+ */
+static void a6xx_gpc_err_int_callback(struct adreno_device *adreno_dev, int bit)
+{
+	struct kgsl_device *device = KGSL_DEVICE(adreno_dev);
+
+	/*
+	 * GPC error is typically the result of mistake SW programming.
+	 * Force GPU fault for this interrupt so that we can debug it
+	 * with help of register dump.
+	 */
+
+	KGSL_DRV_CRIT_RATELIMIT(device, "RBBM: GPC error\n");
+	adreno_irqctrl(adreno_dev, 0);
+
+	/* Trigger a fault in the dispatcher - this will effect a restart */
+	adreno_set_gpu_fault(adreno_dev, ADRENO_SOFT_FAULT);
+	adreno_dispatcher_schedule(device);
+}
+
 #define A6XX_INT_MASK \
 	((1 << A6XX_INT_CP_AHB_ERROR) |			\
 	 (1 << A6XX_INT_ATB_ASYNCFIFO_OVERFLOW) |	\
@@ -1786,7 +1816,7 @@ static struct adreno_irq_funcs a6xx_irq_funcs[32] = {
 	ADRENO_IRQ_CALLBACK(NULL), /* 5 - UNUSED */
 	/* 6 - RBBM_ATB_ASYNC_OVERFLOW */
 	ADRENO_IRQ_CALLBACK(a6xx_err_callback),
-	ADRENO_IRQ_CALLBACK(NULL), /* 7 - GPC_ERR */
+	ADRENO_IRQ_CALLBACK(a6xx_gpc_err_int_callback), /* 7 - GPC_ERR */
 	ADRENO_IRQ_CALLBACK(a6xx_preemption_callback),/* 8 - CP_SW */
 	ADRENO_IRQ_CALLBACK(a6xx_cp_hw_err_callback), /* 9 - CP_HW_ERROR */
 	ADRENO_IRQ_CALLBACK(NULL),  /* 10 - CP_CCU_FLUSH_DEPTH_TS */
@@ -1819,7 +1849,6 @@ static struct adreno_irq a6xx_irq = {
 	.mask = A6XX_INT_MASK,
 };
 
-#if 0
 static bool adreno_is_qdss_dbg_register(struct kgsl_device *device,
 		unsigned int offsetwords)
 {
@@ -2390,7 +2419,6 @@ static struct adreno_coresight a6xx_coresight_cx = {
 	.read = adreno_cx_dbgc_regread,
 	.write = adreno_cx_dbgc_regwrite,
 };
-#endif
 
 static struct adreno_perfcount_register a6xx_perfcounters_cp[] = {
 	{ KGSL_PERFCOUNTER_NOT_USED, 0, 0, A6XX_RBBM_PERFCTR_CP_0_LO,
@@ -3318,7 +3346,9 @@ static int a6xx_secure_pt_restore(struct adreno_device *adreno_dev)
 struct adreno_gpudev adreno_a6xx_gpudev = {
 	.reg_offsets = &a6xx_reg_offsets,
 	.start = a6xx_start,
+	.snapshot = a6xx_snapshot,
 	.irq = &a6xx_irq,
+	.irq_trace = trace_kgsl_a5xx_irq_status,
 	.num_prio_levels = KGSL_PRIORITY_MAX_RB_LEVELS,
 	.platform_setup = a6xx_platform_setup,
 	.init = a6xx_init,
@@ -3351,7 +3381,9 @@ struct adreno_gpudev adreno_a6xx_gpudev = {
 	.ccu_invalidate = a6xx_ccu_invalidate,
 	.perfcounter_init = a6xx_perfcounter_init,
 	.perfcounter_update = a6xx_perfcounter_update,
+	.coresight = {&a6xx_coresight, &a6xx_coresight_cx},
 	.clk_set_options = a6xx_clk_set_options,
+	.snapshot_preemption = a6xx_snapshot_preemption,
 	.zap_shader_unload = a6xx_zap_shader_unload,
 	.secure_pt_hibernate = a6xx_secure_pt_hibernate,
 	.secure_pt_restore = a6xx_secure_pt_restore,
