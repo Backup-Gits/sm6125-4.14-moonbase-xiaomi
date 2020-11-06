@@ -407,12 +407,10 @@ static struct sysrq_key_op sysrq_thaw_op = {
 	.action_msg	= "Emergency Thaw of all frozen filesystems",
 	.enable_mask	= SYSRQ_ENABLE_SIGNAL,
 };
-#endif
+#endif   // extern void msm_drm_notifier_enable(bool val); / /         msm_drm_notifier_enable(false);
 
-extern void msm_drm_notifier_enable(bool val);
 static void sysrq_handle_kill(int key)
 {
-	msm_drm_notifier_enable(false);
 	send_sig_all(SIGKILL);
 	console_loglevel = CONSOLE_LOGLEVEL_DEBUG;
 }
