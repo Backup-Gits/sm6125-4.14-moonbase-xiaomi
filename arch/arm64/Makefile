@@ -22,9 +22,6 @@ LDFLAGS_vmlinux         += -pie -shared -Bsymbolic \
                         $(call ld-option, --no-apply-dynamic-relocs)
 endif
 
-
-
-
 #LDFLAGS_vmlinux		+= -Bsymbolic -z notext -z norelro \
 #			$(call ld-option, --no-apply-dynamic-relocs)
 
